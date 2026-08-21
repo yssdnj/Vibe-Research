@@ -139,6 +139,46 @@ cd frontend && npm install && npm run dev
 # 浏览器打开 http://localhost:5899
 ```
 
+## 登录与用户数据隔离
+
+在 `backend/.env` 配置账号后启用登录页（格式与 TradingAgents-astock 一致）：
+
+```dotenv
+LOGIN_USERS=admin:change-me:admin,viewer:change-me:user
+LOGIN_REMEMBER_SECRET=请替换为强随机字符串
+# HTTPS 部署时启用
+VR_COOKIE_SECURE=1
+# 可选：私有数据根目录
+VR_DATA_DIR=/var/lib/vibe-research
+```
+
+持仓、自选股、研究记录、上传研报和“问 AI”历史均按登录用户隔离。管理员也只能访问自己的数据。目录结构如下，真实用户名不会用于目录名：
+
+```text
+VR_DATA_DIR/users/<sha256(username)前16位>/
+├── identity.json
+├── portfolio.json
+├── watchlist.json
+├── notes.json
+├── chats/<scope哈希>.json
+└── reports/
+    ├── index.json
+    └── files/
+```
+
+`VR_API_KEY` 仅用于公共/自动化 API 鉴权，不能替代用户登录读取上述私有数据。未配置 `LOGIN_USERS` 时，系统保持单用户 `_local` 模式。
+
+升级前请备份 `VR_DATA_DIR`。旧版无用户归属的 `portfolio.json` 和 `myreports/` 不会自动分配给任何账号，可明确指定目标账号迁移；默认复制，确认无误后才使用 `--move`：
+
+```bash
+cd backend
+python3 migrate_user_data.py --to-user admin
+# 确认新账号数据正常后，可选择移动源文件
+python3 migrate_user_data.py --to-user admin --move
+```
+
+迁移命令会拒绝未知账号及已有数据的目标目录，避免覆盖。
+
 ## 接入 AI
 
 在「接入 AI」页配置一次，全站的「问 AI / 复盘 / 今日要点」就都用你自己的模型。**分析都由你的模型给出，本产品不校准、无倾向。** 三种方式：

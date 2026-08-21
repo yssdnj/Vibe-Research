@@ -4,10 +4,12 @@ import {
   Activity, Radar, LayoutGrid, Wallet, Settings, Search, NotebookPen,
   Moon, Sun, ChevronsLeft, ChevronsRight, LineChart, Github, UserRound,
   Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText, Swords,
+  LogOut,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import { storageGet, storageSet } from "@/lib/storage";
+import { useAuth } from "@/lib/auth";
 
 const APP_VERSION = "v0.2.2";
 const REPO_URL = "https://github.com/simonlin1212/Vibe-Research";
@@ -42,6 +44,7 @@ export function Layout() {
   const { pathname } = useLocation();
   const { dark, toggle } = useDarkMode();
   const [collapsed, setCollapsed] = useState(() => storageGet("vr-sidebar") === "collapsed");
+  const auth = useAuth();
 
   useEffect(() => {
     storageSet("vr-sidebar", collapsed ? "collapsed" : "expanded");
@@ -134,6 +137,21 @@ export function Layout() {
             </>
           ) : (
             <>
+              {auth.enabled && auth.user && (
+                <div className="flex items-center justify-between rounded-lg bg-muted/35 px-2.5 py-2 text-xs">
+                  <span className="min-w-0 truncate text-muted-foreground">
+                    {auth.user.role === "admin" ? "管理员" : "用户"} · {auth.user.username}
+                  </span>
+                  <button
+                    onClick={() => auth.logout()}
+                    className="ml-2 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    title="退出登录"
+                    aria-label="退出登录"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
               <div className="flex items-center justify-between">
                 <button onClick={toggle} className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground">
                   {dark ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}

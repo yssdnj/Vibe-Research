@@ -36,6 +36,15 @@ export interface MyReport {
   id: string; name: string; industry: string; size: number; ext: string; ts: number;
 }
 
+export interface UserNote {
+  id: string; kind: string; title: string; content: string; source?: string; ts: number;
+}
+export interface StoredChat {
+  scope: string;
+  messages: { role: "user" | "assistant"; content: string }[];
+  updatedAt: number;
+}
+
 // 下载/预览研报：带鉴权头 fetch → blob → 触发浏览器下载（<a download> 无法带 Authorization，故走 blob）。
 export async function downloadReport(id: string, name: string): Promise<void> {
   const resp = await fetch(`/api/myreports/file/${id}`, { headers: authHeaders() });
@@ -51,7 +60,7 @@ export async function downloadReport(id: string, name: string): Promise<void> {
   URL.revokeObjectURL(url);
 }
 
-async function request<T>(path: string, method: "GET" | "POST" | "DELETE" = "GET", body?: unknown): Promise<T> {
+async function request<T>(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: unknown): Promise<T> {
   let resp: Response;
   const headers: Record<string, string> = { ...authHeaders() };
   const opts: RequestInit = { method };
@@ -283,4 +292,14 @@ export const api = {
   uploadReport: (name: string, contentB64: string) =>
     request<MyReport>("/myreports", "POST", { name, content_b64: contentB64 }),
   deleteReport: (id: string) => request<{ ok: boolean }>(`/myreports/${id}`, "DELETE"),
+  watchlist: () => get<string[]>("/watchlist"),
+  saveWatchlist: (codes: string[]) => request<string[]>("/watchlist", "PUT", { codes }),
+  notes: () => get<UserNote[]>("/notes"),
+  addNote: (kind: string, title: string, content: string, source = "") =>
+    request<UserNote>("/notes", "POST", { kind, title, content, source }),
+  deleteNote: (id: string) => request<{ ok: boolean }>(`/notes/${id}`, "DELETE"),
+  chat: (scope: string) => get<StoredChat>(`/chats/${encodeURIComponent(scope)}`),
+  saveChat: (scope: string, messages: StoredChat["messages"]) =>
+    request<StoredChat>(`/chats/${encodeURIComponent(scope)}`, "PUT", { messages }),
+  clearChat: (scope: string) => request<{ ok: boolean }>(`/chats/${encodeURIComponent(scope)}`, "DELETE"),
 };

@@ -46,7 +46,8 @@ def _migrate_legacy() -> None:
 
 
 _migrate_legacy()
-_LOCK = threading.Lock()  # 索引读-改-写串行化（与 portfolio.py 同款），防并发上传/删除互相覆盖
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
 
 MAX_BYTES = 25 * 1024 * 1024  # 单文件上限 25MB
 # 允许的文档类型（白名单——不存可执行 / 网页等，避免下载回放风险）
@@ -74,25 +75,41 @@ class ReportError(ValueError):
     """上传/校验类错误（对应 HTTP 400/413）。"""
 
 
-def _ensure_dir() -> None:
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+def _paths(reports_dir=None) -> tuple[Path, Path, Path]:
+    root = Path(reports_dir) if reports_dir is not None else REPORTS_DIR
+    files = root / "files" if reports_dir is not None else root
+    return root, root / "index.json", files
 
 
-def _load_index() -> list[dict]:
-    if not _INDEX.exists():
+def _lock_for(index: Path) -> threading.Lock:
+    key = str(index.resolve())
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(key, threading.Lock())
+
+
+def _ensure_dir(reports_dir=None) -> None:
+    root, _, files = _paths(reports_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    files.mkdir(parents=True, exist_ok=True)
+
+
+def _load_index(reports_dir=None) -> list[dict]:
+    _, index, _ = _paths(reports_dir)
+    if not index.exists():
         return []
     try:
-        data = json.loads(_INDEX.read_text("utf-8"))
+        data = json.loads(index.read_text("utf-8"))
         return data if isinstance(data, list) else []
     except (json.JSONDecodeError, OSError):
         return []
 
 
-def _save_index(items: list[dict]) -> None:
-    _ensure_dir()
-    tmp = _INDEX.with_suffix(".json.tmp")
+def _save_index(items: list[dict], reports_dir=None) -> None:
+    _ensure_dir(reports_dir)
+    _, index, _ = _paths(reports_dir)
+    tmp = index.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), "utf-8")
-    os.replace(tmp, _INDEX)  # 原子改名，避免半截写入损坏索引（进程被 kill / OOM）
+    os.replace(tmp, index)  # 原子改名，避免半截写入损坏索引（进程被 kill / OOM）
 
 
 def classify(filename: str) -> str:
@@ -110,12 +127,12 @@ def _sanitize_name(name: str) -> str:
     return base or "未命名"
 
 
-def list_reports() -> list[dict]:
+def list_reports(reports_dir=None) -> list[dict]:
     """按上传时间倒序返回元数据列表。"""
-    return sorted(_load_index(), key=lambda r: r.get("ts", 0), reverse=True)
+    return sorted(_load_index(reports_dir), key=lambda r: r.get("ts", 0), reverse=True)
 
 
-def save_report(name: str, content_b64: str) -> dict:
+def save_report(name: str, content_b64: str, reports_dir=None) -> dict:
     """解码 base64 存盘 + 打行业标签 + 记录元数据。返回该条元数据。"""
     fname = _sanitize_name(name)
     ext = os.path.splitext(fname)[1].lower()
@@ -138,9 +155,10 @@ def save_report(name: str, content_b64: str) -> dict:
     if len(blob) > MAX_BYTES:
         raise ReportError(f"文件过大（{len(blob) // 1024 // 1024}MB），上限 {MAX_BYTES // 1024 // 1024}MB")
 
-    _ensure_dir()
+    _ensure_dir(reports_dir)
+    _, index, files = _paths(reports_dir)
     rid = uuid.uuid4().hex
-    (REPORTS_DIR / f"{rid}{ext}").write_bytes(blob)
+    (files / f"{rid}{ext}").write_bytes(blob)
     meta = {
         "id": rid,
         "name": fname,
@@ -149,33 +167,35 @@ def save_report(name: str, content_b64: str) -> dict:
         "ext": ext,
         "ts": int(time.time() * 1000),
     }
-    with _LOCK:
-        items = _load_index()
+    with _lock_for(index):
+        items = _load_index(reports_dir)
         items.append(meta)
-        _save_index(items)
+        _save_index(items, reports_dir)
     return meta
 
 
-def report_path(rid: str) -> tuple[Path, str] | None:
+def report_path(rid: str, reports_dir=None) -> tuple[Path, str] | None:
     """按 id 取 (磁盘路径, 原始文件名)；不存在返回 None。"""
-    for r in _load_index():
+    _, _, files = _paths(reports_dir)
+    for r in _load_index(reports_dir):
         if r.get("id") == rid:
-            p = REPORTS_DIR / f"{rid}{r.get('ext', '')}"
+            p = files / f"{rid}{r.get('ext', '')}"
             return (p, r.get("name", rid)) if p.exists() else None
     return None
 
 
-def delete_report(rid: str) -> bool:
+def delete_report(rid: str, reports_dir=None) -> bool:
     """删文件 + 移除索引条目。删成功（或本就不在）返回是否命中。"""
-    with _LOCK:
-        items = _load_index()
+    _, index, files = _paths(reports_dir)
+    with _lock_for(index):
+        items = _load_index(reports_dir)
         hit = next((r for r in items if r.get("id") == rid), None)
         if hit is None:
             return False
-        fp = REPORTS_DIR / f"{rid}{hit.get('ext', '')}"
+        fp = files / f"{rid}{hit.get('ext', '')}"
         try:
             fp.unlink(missing_ok=True)
         except OSError:
             pass
-        _save_index([r for r in items if r.get("id") != rid])
+        _save_index([r for r in items if r.get("id") != rid], reports_dir)
     return True

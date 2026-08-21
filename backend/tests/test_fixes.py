@@ -11,6 +11,7 @@ import chat
 import cli_runtime
 import market
 import portfolio as pf
+import user_storage as us
 
 client = TestClient(app_module.app)
 
@@ -30,10 +31,8 @@ def test_api_key_auth(monkeypatch):
 
 @pytest.fixture()
 def tmp_pf(tmp_path, monkeypatch):
-    monkeypatch.setattr(pf, "CACHE_DIR", str(tmp_path))
-    monkeypatch.setattr(pf, "PF_FILE", str(tmp_path / "portfolio.json"))
     monkeypatch.setattr(astock, "tencent_quote", lambda codes: {c: {"name": f"股{c}", "price": 10.0} for c in codes})
-    return tmp_path
+    return us.user_dir(us.UserIdentity("_local", "local"))
 
 
 def test_portfolio_crud_roundtrip(tmp_pf):

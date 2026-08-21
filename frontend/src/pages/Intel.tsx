@@ -186,7 +186,7 @@ interface FeedRow { code: string; name: string; when: string; title: string; met
 const MAX_ROWS = 60;
 
 function WatchlistFeed({ kind }: { kind: "filings" | "news" }) {
-  const [codes, setCodes] = useState<string[]>(loadWatch);
+  const [codes, setCodes] = useState<string[]>([]);
   const [rows, setRows] = useState<FeedRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -242,9 +242,9 @@ function WatchlistFeed({ kind }: { kind: "filings" | "news" }) {
     }
   }, [kind]);
 
-  useEffect(() => { const cs = loadWatch(); setCodes(cs); load(cs); }, [load]);
+  useEffect(() => { void loadWatch().then((cs) => { setCodes(cs); load(cs); }); }, [load]);
 
-  const refresh = () => { const cs = loadWatch(); setCodes(cs); load(cs); };
+  const refresh = () => { void loadWatch().then((cs) => { setCodes(cs); load(cs); }); };
 
   if (!codes.length) {
     return (

@@ -84,7 +84,7 @@ export function Debate() {
 
   function save() {
     const body = stages.map((s) => `## ${s.label}\n\n${s.content}`).join("\n\n---\n\n");
-    addNote("多空辩论", `多空辩论 · ${code.trim()}`, body);
+    void addNote("多空辩论", `多空辩论 · ${code.trim()}`, body);
     setSaved(true);
   }
 

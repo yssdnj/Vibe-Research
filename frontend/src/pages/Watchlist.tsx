@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Plus, X, RefreshCw, Star } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
@@ -33,11 +33,13 @@ const saveLive = (on: boolean) => {
 };
 
 export function Watchlist() {
-  const [codes, setCodes] = useState<string[]>(loadWatch);
+  const [codes, setCodes] = useState<string[]>([]);
   const [input, setInput] = useState("");
   const [hint, setHint] = useState<string | null>(null);
   // 实时行情默认**关闭**——开着会持续请求，让用户自己决定要不要开。
   const [live, setLive] = useState(loadLive);
+
+  useEffect(() => { loadWatch().then(setCodes).catch(() => setHint("自选股加载失败")); }, []);
 
   const { quotes, loading, updatedAt, polling, error, refresh } = useLiveQuotes(codes, live);
 
@@ -56,11 +58,11 @@ export function Watchlist() {
       setInput("");
       return;
     }
-    setCodes(next); saveWatch(next); setInput(""); setHint(`已添加 ${added} 只`);
+    setCodes(next); void saveWatch(next).catch(() => setHint("自选股保存失败")); setInput(""); setHint(`已添加 ${added} 只`);
   };
   const remove = (c: string) => {
     const next = codes.filter((x) => x !== c);
-    setCodes(next); saveWatch(next);
+    setCodes(next); void saveWatch(next).catch(() => setHint("自选股保存失败"));
   };
 
   const aiContext = useMemo(

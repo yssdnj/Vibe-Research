@@ -8,7 +8,7 @@ export function SaveNoteButton({ kind, title, content }: { kind: string; title: 
   if (!content.trim()) return null;
   return (
     <button
-      onClick={() => { addNote(kind, title, content); setSaved(true); }}
+      onClick={() => { void addNote(kind, title, content).then(() => setSaved(true)); }}
       disabled={saved}
       className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-primary disabled:opacity-60"
     >

@@ -11,11 +11,19 @@ from __future__ import annotations
 
 import json
 import os
+import base64
+import hashlib
+import hmac
+import time
+import uuid
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"), override=False)
 
 import astock
 import chat as chat_layer
@@ -26,7 +34,9 @@ import newsradar
 import portfolio as pf
 import market
 import myreports as mr
+import private_json as pj
 import reflection as reflect_layer
+import user_storage as us
 
 app = FastAPI(title="Vibe-Research API", version="0.2.2")
 
@@ -39,7 +49,7 @@ _ORIGINS = [o.strip() for o in os.environ.get("VR_ALLOW_ORIGINS", "*").split(","
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ORIGINS,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -47,17 +57,95 @@ app.add_middleware(
 #   （本地自托管不设=开放；公网部署务必设，否则别人能读你的持仓/调你的后端）。
 _API_KEY = os.environ.get("VR_API_KEY", "").strip()
 
+_SESSION_COOKIE = "vr_session"
+_REMEMBER_TTL_SECONDS = 30 * 24 * 60 * 60
+_SESSION_TTL_SECONDS = 12 * 60 * 60
+
+
+def _parse_login_users(raw: str) -> dict[str, dict[str, str]]:
+    users: dict[str, dict[str, str]] = {}
+    for entry in raw.split(","):
+        parts = entry.strip().split(":")
+        if len(parts) != 3:
+            continue
+        username, password, role = (part.strip() for part in parts)
+        if username and password:
+            users[username] = {"password": password, "role": role or "user"}
+    return users
+
+
+_LOGIN_USERS_RAW = os.environ.get("LOGIN_USERS", "")
+_LOGIN_USERS = _parse_login_users(_LOGIN_USERS_RAW)
+_LOGIN_SECRET = os.environ.get("LOGIN_REMEMBER_SECRET", "").strip() or hashlib.sha256(
+    _LOGIN_USERS_RAW.encode("utf-8")
+).hexdigest()
+
+
+def _b64encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _create_session(username: str, role: str, ttl_seconds: int) -> str:
+    payload = _b64encode(json.dumps({
+        "v": 1,
+        "username": username,
+        "role": role,
+        "exp": int(time.time()) + ttl_seconds,
+    }, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    signature = _b64encode(hmac.new(
+        _LOGIN_SECRET.encode("utf-8"), payload.encode("ascii"), hashlib.sha256,
+    ).digest())
+    return f"{payload}.{signature}"
+
+
+def _session_user(request: Request) -> dict[str, str] | None:
+    token = request.cookies.get(_SESSION_COOKIE, "")
+    try:
+        payload, signature = token.split(".", 1)
+        expected = _b64encode(hmac.new(
+            _LOGIN_SECRET.encode("utf-8"), payload.encode("ascii"), hashlib.sha256,
+        ).digest())
+        if not hmac.compare_digest(signature, expected):
+            return None
+        data = json.loads(_b64decode(payload))
+        if data.get("v") != 1 or int(data.get("exp", 0)) < int(time.time()):
+            return None
+        username = str(data.get("username", ""))
+        role = str(data.get("role", ""))
+        user = _LOGIN_USERS.get(username)
+        if not user or user.get("role") != role:
+            return None
+        return {"username": username, "role": role}
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
 
 @app.middleware("http")
 async def _require_api_key(request: Request, call_next):
+    is_auth_route = request.url.path.startswith("/api/auth/")
+    valid_bearer = bool(
+        _API_KEY and request.headers.get("authorization", "") == f"Bearer {_API_KEY}"
+    )
+    session_user = _session_user(request) if _LOGIN_USERS else None
+    request.state.user = (
+        us.UserIdentity(session_user["username"], session_user["role"])
+        if session_user
+        else us.UserIdentity("_local", "local") if not _LOGIN_USERS else None
+    )
+    valid_session = bool(session_user)
     if (
-        _API_KEY
+        (_API_KEY or _LOGIN_USERS)
         and request.method != "OPTIONS"
         and request.url.path.startswith("/api/")
         and request.url.path != "/api/health"
+        and not is_auth_route
     ):
-        if request.headers.get("authorization", "") != f"Bearer {_API_KEY}":
-            return JSONResponse({"detail": "未授权：缺少或错误的 API Key（VR_API_KEY）"}, status_code=401)
+        if not valid_bearer and not valid_session:
+            return JSONResponse({"detail": "登录已失效，请重新登录"}, status_code=401)
     return await call_next(request)
 
 _CODE_RE = r"^\d{6}$"
@@ -73,6 +161,52 @@ def _validate(code: str) -> str:
 @app.get("/api/health")
 def health():
     return {"ok": True, "service": "vibe-research-api", "version": "0.2.2"}
+
+
+class LoginReq(BaseModel):
+    username: str
+    password: str
+    remember: bool = True
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    if not _LOGIN_USERS:
+        return {"enabled": False, "authenticated": True, "user": None}
+    user = _session_user(request)
+    return {"enabled": True, "authenticated": bool(user), "user": user}
+
+
+@app.post("/api/auth/login")
+def auth_login(req: LoginReq):
+    user = _LOGIN_USERS.get(req.username.strip())
+    supplied = req.password
+    valid = bool(user and hmac.compare_digest(user["password"], supplied))
+    if not valid:
+        raise HTTPException(401, "账号或密码错误")
+
+    ttl = _REMEMBER_TTL_SECONDS if req.remember else _SESSION_TTL_SECONDS
+    response = JSONResponse({
+        "ok": True,
+        "user": {"username": req.username.strip(), "role": user["role"]},
+    })
+    response.set_cookie(
+        _SESSION_COOKIE,
+        _create_session(req.username.strip(), user["role"], ttl),
+        max_age=_REMEMBER_TTL_SECONDS if req.remember else None,
+        httponly=True,
+        secure=os.environ.get("VR_COOKIE_SECURE", "").lower() in ("1", "true", "yes"),
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(_SESSION_COOKIE, path="/", samesite="lax")
+    return response
 
 
 class LLMConfig(BaseModel):
@@ -189,17 +323,151 @@ class HoldingIn(BaseModel):
     cost: float
 
 
-@app.get("/api/portfolio")
-def portfolio_get():
-    """持仓 + 实时盈亏（浮动盈亏红涨绿跌）。"""
+def _private_user_dir(request: Request):
+    return us.user_dir(us.private_identity(request))
+
+
+class WatchlistIn(BaseModel):
+    codes: list[str]
+
+
+@app.get("/api/watchlist")
+def watchlist_get(request: Request):
+    data = pj.load(_private_user_dir(request) / "watchlist.json", [])
+    return {"data": data if isinstance(data, list) else []}
+
+
+@app.put("/api/watchlist")
+def watchlist_put(body: WatchlistIn, request: Request):
+    codes: list[str] = []
+    for raw in body.codes:
+        code = str(raw).strip()
+        if not code.isdigit() or len(code) != 6:
+            raise HTTPException(400, "股票代码必须是 6 位数字")
+        if code not in codes:
+            codes.append(code)
+    if len(codes) > 200:
+        raise HTTPException(400, "自选股最多保存 200 个代码")
+    pj.save(_private_user_dir(request) / "watchlist.json", codes)
+    return {"data": codes}
+
+
+class NoteIn(BaseModel):
+    kind: str
+    title: str
+    content: str
+    source: str = ""
+
+
+@app.get("/api/notes")
+def notes_get(request: Request):
+    data = pj.load(_private_user_dir(request) / "notes.json", [])
+    return {"data": data if isinstance(data, list) else []}
+
+
+@app.post("/api/notes")
+def notes_add(body: NoteIn, request: Request):
+    kind, title, content, source = (
+        body.kind.strip(), body.title.strip(), body.content, body.source.strip()
+    )
+    if not kind or len(kind) > 50 or not title or len(title) > 200:
+        raise HTTPException(400, "记录类型或标题不符合长度要求")
+    if not content or len(content) > 100_000 or len(source) > 500:
+        raise HTTPException(400, "记录正文或来源不符合长度要求")
+    path = _private_user_dir(request) / "notes.json"
+    note = {
+        "id": uuid.uuid4().hex, "kind": kind, "title": title,
+        "content": content, "source": source, "ts": int(time.time() * 1000),
+    }
+
+    def add(items):
+        items = items if isinstance(items, list) else []
+        if len(items) >= 1000:
+            raise HTTPException(400, "研究记录最多保存 1000 条")
+        return note, [note, *items]
+
+    return {"data": pj.mutate(path, [], add)}
+
+
+@app.delete("/api/notes/{note_id}")
+def notes_delete(note_id: str, request: Request):
+    path = _private_user_dir(request) / "notes.json"
+
+    def remove(items):
+        items = items if isinstance(items, list) else []
+        found = any(item.get("id") == note_id for item in items if isinstance(item, dict))
+        return found, [item for item in items if not isinstance(item, dict) or item.get("id") != note_id]
+
+    if not pj.mutate(path, [], remove):
+        raise HTTPException(404, "研究记录不存在")
+    return {"data": {"ok": True}}
+
+
+class StoredChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class StoredChatIn(BaseModel):
+    messages: list[StoredChatMessage]
+
+
+def _chat_path(request: Request, scope: str):
+    scope = scope.strip()
+    if not scope or len(scope) > 200 or any(ord(char) < 32 for char in scope):
+        raise HTTPException(400, "会话范围无效")
+    key = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    return scope, _private_user_dir(request) / "chats" / f"{key}.json"
+
+
+@app.get("/api/chats/{scope}")
+def stored_chat_get(scope: str, request: Request):
+    clean_scope, path = _chat_path(request, scope)
+    data = pj.load(path, None)
+    if not isinstance(data, dict) or data.get("scope") != clean_scope:
+        data = {"scope": clean_scope, "messages": [], "updatedAt": 0}
+    return {"data": data}
+
+
+@app.put("/api/chats/{scope}")
+def stored_chat_put(scope: str, body: StoredChatIn, request: Request):
+    clean_scope, path = _chat_path(request, scope)
+    if len(body.messages) > 40:
+        raise HTTPException(400, "会话最多保存 40 条消息")
+    messages = []
+    for message in body.messages:
+        if message.role not in {"user", "assistant"} or not message.content:
+            raise HTTPException(400, "会话消息格式无效")
+        messages.append({"role": message.role, "content": message.content})
+    data = {"scope": clean_scope, "messages": messages, "updatedAt": int(time.time() * 1000)}
+    if len(json.dumps(data, ensure_ascii=False).encode("utf-8")) > 512 * 1024:
+        raise HTTPException(413, "会话内容超过 512 KiB")
+    pj.save(path, data)
+    return {"data": data}
+
+
+@app.delete("/api/chats/{scope}")
+def stored_chat_delete(scope: str, request: Request):
+    _, path = _chat_path(request, scope)
     try:
-        return {"data": pf.get_portfolio()}
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise HTTPException(500, "清除会话失败") from exc
+    return {"data": {"ok": True}}
+
+
+@app.get("/api/portfolio")
+def portfolio_get(request: Request):
+    """持仓 + 实时盈亏（浮动盈亏红涨绿跌）。"""
+    data_dir = _private_user_dir(request)
+    try:
+        return {"data": pf.get_portfolio(data_dir)}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"持仓读取异常：{e}") from e
 
 
 @app.post("/api/portfolio/holding")
-def portfolio_add(h: HoldingIn):
+def portfolio_add(h: HoldingIn, request: Request):
     """加一笔持仓（同代码按加权平均成本合并）。存本地，不上传。"""
     code = (h.code or "").strip()
     if not code.isdigit() or len(code) != 6:
@@ -207,12 +475,12 @@ def portfolio_add(h: HoldingIn):
     if h.shares <= 0:
         raise HTTPException(400, "数量必须大于 0")
     # 成本价不限正负：融券 / 返息 / 摊薄后为负成本等情形按结果计算，用户想怎么输就怎么输。
-    return {"data": pf.add_holding(code, h.shares, h.cost)}
+    return {"data": pf.add_holding(code, h.shares, h.cost, _private_user_dir(request))}
 
 
 @app.delete("/api/portfolio/holding")
-def portfolio_remove(code: str = Query(...)):
-    return {"data": pf.remove_holding(code.strip())}
+def portfolio_remove(request: Request, code: str = Query(...)):
+    return {"data": pf.remove_holding(code.strip(), _private_user_dir(request))}
 
 
 # ---- 我的研报（用户上传自己的研报，存本地、不上传、不进开源仓库）----
@@ -223,23 +491,23 @@ class ReportIn(BaseModel):
 
 
 @app.get("/api/myreports")
-def myreports_list():
-    return {"data": mr.list_reports()}
+def myreports_list(request: Request):
+    return {"data": mr.list_reports(_private_user_dir(request) / "reports")}
 
 
 @app.post("/api/myreports")
-def myreports_upload(r: ReportIn):
+def myreports_upload(r: ReportIn, request: Request):
     """上传一份研报（base64）→ 存本地 + 按文件名自动打行业标签。"""
     try:
-        return {"data": mr.save_report(r.name, r.content_b64)}
+        return {"data": mr.save_report(r.name, r.content_b64, _private_user_dir(request) / "reports")}
     except mr.ReportError as e:
         raise HTTPException(400, str(e)) from e
 
 
 @app.get("/api/myreports/file/{rid}")
-def myreports_file(rid: str):
+def myreports_file(rid: str, request: Request):
     """下载/预览某份研报原文件。"""
-    hit = mr.report_path(rid)
+    hit = mr.report_path(rid, _private_user_dir(request) / "reports")
     if not hit:
         raise HTTPException(404, "研报不存在")
     path, name = hit
@@ -247,8 +515,8 @@ def myreports_file(rid: str):
 
 
 @app.delete("/api/myreports/{rid}")
-def myreports_delete(rid: str):
-    return {"data": {"ok": mr.delete_report(rid)}}
+def myreports_delete(rid: str, request: Request):
+    return {"data": {"ok": mr.delete_report(rid, _private_user_dir(request) / "reports")}}
 
 
 class CloseIn(BaseModel):
@@ -260,7 +528,7 @@ class CloseIn(BaseModel):
 
 
 @app.post("/api/portfolio/close")
-def portfolio_close(c: CloseIn):
+def portfolio_close(c: CloseIn, request: Request):
     """记一笔已清仓（已实现盈亏）。存本地。"""
     code = (c.code or "").strip()
     if not code.isdigit() or len(code) != 6:
@@ -276,19 +544,20 @@ def portfolio_close(c: CloseIn):
         datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
         raise HTTPException(400, "清仓日期格式应为 YYYY-MM-DD") from None
-    return {"data": pf.close_position(code, date, c.price, c.shares, c.cost)}
+    return {"data": pf.close_position(code, date, c.price, c.shares, c.cost, _private_user_dir(request))}
 
 
 @app.delete("/api/portfolio/close")
-def portfolio_close_remove(index: int = Query(...)):
-    return {"data": pf.remove_closed(index)}
+def portfolio_close_remove(request: Request, index: int = Query(...)):
+    return {"data": pf.remove_closed(index, _private_user_dir(request))}
 
 
 @app.post("/api/portfolio/refresh")
-def portfolio_refresh():
+def portfolio_refresh(request: Request):
     """手动刷新：立即重拉行情算盈亏。"""
+    data_dir = _private_user_dir(request)
     try:
-        return {"data": pf.get_portfolio()}
+        return {"data": pf.get_portfolio(data_dir)}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"刷新失败：{e}") from e
 

@@ -1,4 +1,4 @@
-import { createBrowserRouter, Navigate } from "react-router-dom";
+import { createBrowserRouter, Navigate, Outlet } from "react-router-dom";
 import { Layout } from "@/components/layout/Layout";
 import { DailyReview } from "@/pages/DailyReview";
 import { Intel } from "@/pages/Intel";
@@ -11,23 +11,39 @@ import { Watchlist } from "@/pages/Watchlist";
 import { MyReports } from "@/pages/MyReports";
 import { Notes } from "@/pages/Notes";
 import { Settings } from "@/pages/Settings";
+import { Login } from "@/pages/Login";
+import { AuthProvider } from "@/lib/auth";
+import { ProtectedRoute } from "@/components/auth/ProtectedRoute";
+
+function AuthRoot() {
+  return <AuthProvider><Outlet /></AuthProvider>;
+}
 
 export const router = createBrowserRouter([
   {
-    element: <Layout />,
+    element: <AuthRoot />,
     children: [
-      { path: "/", element: <Navigate to="/daily-review" replace /> },
-      { path: "/daily-review", element: <DailyReview /> },
-      { path: "/intel", element: <Intel /> },
-      { path: "/sectors", element: <Sectors /> },
-      { path: "/sectors/:key", element: <SectorDetail /> },
-      { path: "/portfolio", element: <Portfolio /> },
-      { path: "/stock-data", element: <StockData /> },
-      { path: "/debate", element: <Debate /> },
-      { path: "/watchlist", element: <Watchlist /> },
-      { path: "/my-reports", element: <MyReports /> },
-      { path: "/notes", element: <Notes /> },
-      { path: "/settings", element: <Settings /> },
+      { path: "/login", element: <Login /> },
+      {
+        element: <ProtectedRoute />,
+        children: [{
+          element: <Layout />,
+          children: [
+            { path: "/", element: <Navigate to="/daily-review" replace /> },
+            { path: "/daily-review", element: <DailyReview /> },
+            { path: "/intel", element: <Intel /> },
+            { path: "/sectors", element: <Sectors /> },
+            { path: "/sectors/:key", element: <SectorDetail /> },
+            { path: "/portfolio", element: <Portfolio /> },
+            { path: "/stock-data", element: <StockData /> },
+            { path: "/debate", element: <Debate /> },
+            { path: "/watchlist", element: <Watchlist /> },
+            { path: "/my-reports", element: <MyReports /> },
+            { path: "/notes", element: <Notes /> },
+            { path: "/settings", element: <Settings /> },
+          ],
+        }],
+      },
     ],
   },
 ]);

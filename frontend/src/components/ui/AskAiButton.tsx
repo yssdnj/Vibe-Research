@@ -5,9 +5,8 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { cn } from "@/lib/utils";
 import { hasLlm, chatStream, type ChatMsg } from "@/lib/llm";
-import { ApiError } from "@/lib/api";
+import { api, ApiError } from "@/lib/api";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
-import { storageGet, storageSet, storageRemove } from "@/lib/storage";
 
 // 对话持久化（#19）。此前 msgs 只是组件内的 useState：切页面卸载、刷新、
 // 关标签页，问过的东西全没了——用户反馈「关闭 AI 就找不回之前的对话」，
@@ -15,9 +14,7 @@ import { storageGet, storageSet, storageRemove } from "@/lib/storage";
 //
 // 按路由分开存：不同页面的「问 AI」上下文不同（个股页 vs 板块页），
 // 混在一起会把上一页的对话带到下一页，比不存更让人困惑。
-const CHAT_KEY_PREFIX = "vr-askai-chat:";
-// 单页对话上限。localStorage 总配额约 5MB，而一轮研报级回答可能上万字；
-// 不设上限迟早写爆，届时 storageSet 静默失败、用户以为存上了。
+// 单页对话上限，避免研报级长回答让用户存储无限增长。
 const MAX_PERSISTED_MSGS = 40;
 
 type StoredMsg = ChatMsg & {
@@ -27,23 +24,6 @@ type StoredMsg = ChatMsg & {
   // UI 仍然显示，用户能看到已经拿到的部分。
   partial?: boolean;
 };
-
-function loadChat(key: string): StoredMsg[] {
-  const raw = storageGet(key);
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    // 存量数据可能来自旧版本或被手工改坏，形状不对就当没有，别让页面崩。
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (m): m is StoredMsg =>
-        m && typeof m === "object" && typeof m.content === "string" &&
-        (m.role === "user" || m.role === "assistant"),
-    );
-  } catch {
-    return [];
-  }
-}
 
 // 只保留「完整的轮次」。partial 的 assistant 要连同它前面那条 user 一起丢：
 // 只丢 assistant 会留下一个孤立的提问，模型在 history 里看到连续两条 user 发言，
@@ -58,19 +38,6 @@ function completeTurns(msgs: StoredMsg[]): StoredMsg[] {
     out.push(m);
   }
   return out;
-}
-
-function saveChat(key: string, msgs: StoredMsg[]): void {
-  if (!msgs.length) {
-    storageRemove(key);
-    return;
-  }
-  const keep = completeTurns(msgs);
-  if (!keep.length) {
-    storageRemove(key);
-    return;
-  }
-  storageSet(key, JSON.stringify(keep.slice(-MAX_PERSISTED_MSGS)));
 }
 
 interface Props {
@@ -106,7 +73,8 @@ interface ToolUse { name: string; arg: string }
 // AI 可自行调 A股数据工具作答。结论由用户模型给出，本产品不校准、不负责。
 export function AskAiButton({ context, suggestions = [], label = "问 AI", scopeKey }: Props) {
   const { pathname } = useLocation();
-  const chatKey = CHAT_KEY_PREFIX + pathname + (scopeKey ? `#${scopeKey}` : "");
+  const routeScope = pathname.replace(/^\/+/, "") || "home";
+  const chatKey = routeScope + (scopeKey ? `#${scopeKey}` : "");
 
   const [open, setOpen] = useState(false);
   const [configured, setConfigured] = useState(false);
@@ -116,8 +84,9 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", scope
   // 覆盖掉目标页已存的对话。捆在一起后，转场帧里 chat.key 天然还是旧值，守卫必然拦住。
   // 惰性初始化：首帧就带上已存的对话，避免先渲染空列表再闪一下补上。
   const [chat, setChat] = useState<{ key: string; msgs: StoredMsg[] }>(
-    () => ({ key: chatKey, msgs: loadChat(chatKey) }),
+    () => ({ key: chatKey, msgs: [] }),
   );
+  const [loadedKey, setLoadedKey] = useState("");
   const msgs = chat.msgs;
   const setMsgs = (
     updater: StoredMsg[] | ((prev: StoredMsg[]) => StoredMsg[]),
@@ -147,15 +116,26 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", scope
     abortRef.current?.abort();
     abortRef.current = null;
     setLoading(false);
-    setChat({ key: chatKey, msgs: loadChat(chatKey) });
+    setLoadedKey("");
+    setChat({ key: chatKey, msgs: [] });
+    let active = true;
+    void api.chat(chatKey).then((stored) => {
+      if (active && chatKeyRef.current === chatKey) {
+        setChat({ key: chatKey, msgs: stored.messages });
+        setLoadedKey(chatKey);
+      }
+    }).catch(() => { if (active) setLoadedKey(chatKey); });
+    return () => { active = false; };
   }, [chatKey]);
 
   // 每次消息变动落盘。守卫见上方 chat state 的注释：转场帧里 chat.key 仍是旧值，
   // 与 chatKey 不等，于是不会把旧对话写进新 key。
   useEffect(() => {
-    if (chat.key !== chatKey) return;
-    saveChat(chatKey, chat.msgs);
-  }, [chatKey, chat]);
+    if (chat.key !== chatKey || loadedKey !== chatKey) return;
+    const keep = completeTurns(chat.msgs).slice(-MAX_PERSISTED_MSGS).map(({ role, content }) => ({ role, content }));
+    const persist = keep.length ? api.saveChat(chatKey, keep) : api.clearChat(chatKey);
+    void persist.catch(() => setErr("会话保存失败"));
+  }, [chatKey, chat, loadedKey]);
 
   useEffect(() => () => abortRef.current?.abort(), []); // 组件卸载兜底
 
@@ -164,7 +144,7 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", scope
     abortRef.current = null;
     setLoading(false);
     setErr(null);
-    setMsgs([]);          // saveChat 见空数组会 storageRemove，不留空壳
+    setMsgs([]);
   };
 
   const close = () => {
@@ -267,7 +247,7 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", scope
               </span>
               <div className="flex items-center gap-1">
                 {msgs.length > 0 && (
-                  // 存了就得能删：对话留在本机 localStorage，用户得有办法清掉。
+                  // 存了就得能删，用户必须能清理自己的对话。
                   <button
                     onClick={clearChat}
                     title="清空本页对话"

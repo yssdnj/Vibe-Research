@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import astock
 
@@ -27,7 +28,21 @@ _OLD_PF_FILE = os.path.join(HERE, ".cache", "portfolio.json")  # ≤v0.1.1 旧�
 CACHE_DIR = os.environ.get("VR_DATA_DIR") or os.path.join(os.path.expanduser("~"), ".vibe-research")
 PF_FILE = os.path.join(CACHE_DIR, "portfolio.json")
 BEIJING = timezone(timedelta(hours=8))
-_LOCK = threading.Lock()
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _paths(data_dir: str | os.PathLike[str] | None = None) -> tuple[str, str]:
+    if data_dir is None:
+        return CACHE_DIR, PF_FILE
+    root = os.fspath(data_dir)
+    return root, os.path.join(root, "portfolio.json")
+
+
+def _lock_for(path: str) -> threading.Lock:
+    key = os.path.abspath(path)
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(key, threading.Lock())
 
 
 def _migrate_legacy() -> None:
@@ -50,27 +65,30 @@ def _now() -> str:
     return datetime.now(BEIJING).strftime("%Y-%m-%d %H:%M")
 
 
-def _load() -> dict:
+def _load(data_dir: str | os.PathLike[str] | None = None) -> dict:
+    _, path = _paths(data_dir)
     try:
-        with open(PF_FILE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {"holdings": [], "last_refresh": None}
 
 
-def _save(d: dict) -> None:
+def _save(d: dict, data_dir: str | os.PathLike[str] | None = None) -> None:
     # 先写临时文件再原子改名：并发读若撞上写中途的半截 JSON，会被 _load 静默当成空持仓
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    tmp = PF_FILE + ".tmp"
+    root, path = _paths(data_dir)
+    os.makedirs(root, exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False)
-    os.replace(tmp, PF_FILE)
+    os.replace(tmp, path)
 
 
-def add_holding(code: str, shares: float, cost: float) -> dict:
+def add_holding(code: str, shares: float, cost: float, data_dir=None) -> dict:
     """加一笔持仓；同代码则按加权平均成本合并（加仓）。"""
-    with _LOCK:
-        d = _load()
+    _, path = _paths(data_dir)
+    with _lock_for(path):
+        d = _load(data_dir)
         for h in d["holdings"]:
             if h["code"] == code:
                 total = h["shares"] + shares
@@ -80,23 +98,25 @@ def add_holding(code: str, shares: float, cost: float) -> dict:
                 break
         else:
             d["holdings"].append({"code": code, "shares": shares, "cost": cost})
-        _save(d)
-    return get_portfolio()
+        _save(d, data_dir)
+    return get_portfolio(data_dir)
 
 
-def remove_holding(code: str) -> dict:
-    with _LOCK:
-        d = _load()
+def remove_holding(code: str, data_dir=None) -> dict:
+    _, path = _paths(data_dir)
+    with _lock_for(path):
+        d = _load(data_dir)
         d["holdings"] = [h for h in d["holdings"] if h["code"] != code]
-        _save(d)
-    return get_portfolio()
+        _save(d, data_dir)
+    return get_portfolio(data_dir)
 
 
-def close_position(code: str, date: str, price: float, shares: float, cost: float) -> dict:
+def close_position(code: str, date: str, price: float, shares: float, cost: float, data_dir=None) -> dict:
     """记一笔已清仓：算已实现盈亏，存入 closed 列表。"""
     pnl = (price - cost) * shares
-    with _LOCK:
-        d = _load()
+    _, path = _paths(data_dir)
+    with _lock_for(path):
+        d = _load(data_dir)
         d.setdefault("closed", [])
         try:
             name = astock.tencent_quote([code]).get(code, {}).get("name", code)
@@ -107,24 +127,26 @@ def close_position(code: str, date: str, price: float, shares: float, cost: floa
             "shares": shares, "cost": cost, "pnl": round(pnl, 2),
             "pnl_pct": round((price - cost) / cost * 100, 2) if cost else 0.0,
         })
-        _save(d)
-    return get_portfolio()
+        _save(d, data_dir)
+    return get_portfolio(data_dir)
 
 
-def remove_closed(index: int) -> dict:
-    with _LOCK:
-        d = _load()
+def remove_closed(index: int, data_dir=None) -> dict:
+    _, path = _paths(data_dir)
+    with _lock_for(path):
+        d = _load(data_dir)
         cl = d.get("closed", [])
         if 0 <= index < len(cl):
             cl.pop(index)
-            _save(d)
-    return get_portfolio()
+            _save(d, data_dir)
+    return get_portfolio(data_dir)
 
 
-def get_portfolio() -> dict:
+def get_portfolio(data_dir=None) -> dict:
     """读持仓 + 实时行情，算每笔与汇总的市值/浮动盈亏。"""
-    with _LOCK:
-        d = _load()
+    _, path = _paths(data_dir)
+    with _lock_for(path):
+        d = _load(data_dir)
     hs = d.get("holdings", [])
     rows, tmv, tcost = [], 0.0, 0.0
     if hs:
@@ -162,12 +184,20 @@ def get_portfolio() -> dict:
     }
 
 
-def _refresh_snapshot() -> None:
+def _refresh_snapshot(data_dir=None) -> None:
     """后台定时任务：刷新时间戳（GET 本就实时算，这里记录后台刷新点）。"""
-    with _LOCK:
-        d = _load()
+    _, path = _paths(data_dir)
+    with _lock_for(path):
+        d = _load(data_dir)
         d["last_refresh"] = _now()
-        _save(d)
+        _save(d, data_dir)
+
+
+def _scheduled_data_dirs() -> list[Path]:
+    root = Path(os.environ.get("VR_DATA_DIR") or Path.home() / ".vibe-research") / "users"
+    if not root.is_dir():
+        return []
+    return sorted((path for path in root.iterdir() if path.is_dir()), key=lambda path: path.name)
 
 
 def start_scheduler(interval: int = 1800) -> None:
@@ -175,8 +205,9 @@ def start_scheduler(interval: int = 1800) -> None:
     def loop():
         while True:
             time.sleep(interval)
-            try:
-                _refresh_snapshot()
-            except Exception:
-                pass
+            for data_dir in _scheduled_data_dirs():
+                try:
+                    _refresh_snapshot(data_dir)
+                except Exception:
+                    pass
     threading.Thread(target=loop, daemon=True).start()

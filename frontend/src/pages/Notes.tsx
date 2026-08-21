@@ -1,11 +1,11 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Trash2, ChevronDown, ChevronRight, NotebookPen, ScanSearch, Save } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
-import { loadNotes, deleteNote, clearNotes, addNote, type Note } from "@/lib/notes";
+import { loadNotes, deleteNote, addNote, type Note } from "@/lib/notes";
 import { reflectStream } from "@/lib/agents";
 import { ApiError } from "@/lib/api";
 
@@ -18,7 +18,7 @@ const KIND_COLOR: Record<string, string> = {
 };
 
 export function Notes() {
-  const [notes, setNotes] = useState<Note[]>(loadNotes);
+  const [notes, setNotes] = useState<Note[]>([]);
   const [openId, setOpenId] = useState<string | null>(null);
   // 反思：对某条记录做推理审计。只保留「当前这条」的结果，避免一堆长文同时挂在页面上。
   const [reflectId, setReflectId] = useState<string | null>(null);
@@ -27,6 +27,8 @@ export function Notes() {
   const [reflecting, setReflecting] = useState(false);
   const [reflectSaved, setReflectSaved] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => { void loadNotes().then(setNotes); }, []);
 
   async function runReflect(n: Note) {
     abortRef.current?.abort();
@@ -47,8 +49,9 @@ export function Notes() {
     }
   }
 
-  function saveReflection(n: Note) {
-    setNotes(addNote("反思审计", `反思 · ${n.title}`, reflectText));
+  async function saveReflection(n: Note) {
+    const created = await addNote("反思审计", `反思 · ${n.title}`, reflectText);
+    setNotes((items) => [created, ...items]);
     setReflectSaved(true);
   }
 
@@ -60,7 +63,7 @@ export function Notes() {
         title="研究记录"
         subtitle="把 AI 复盘 / 要点 / 问答沉淀在本地，随时回看。数据只存本地、不上传。"
         actions={notes.length > 0 && (
-          <button onClick={() => { if (confirm("清空所有研究记录？")) { clearNotes(); setNotes([]); } }}
+          <button onClick={() => { if (confirm("清空所有研究记录？")) { void Promise.all(notes.map((n) => deleteNote(n.id))).then(() => setNotes([])); } }}
             className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm text-muted-foreground hover:text-destructive">
             <Trash2 className="h-4 w-4" /> 清空
           </button>
@@ -87,7 +90,7 @@ export function Notes() {
                     <span className="flex-1 truncate text-sm font-medium">{n.title}</span>
                     <span className="shrink-0 font-mono text-[11px] text-muted-foreground/60">{fmt(n.ts)}</span>
                   </button>
-                  <button onClick={() => setNotes(deleteNote(n.id))} className="shrink-0 text-muted-foreground/60 hover:text-destructive" title="删除">
+                  <button onClick={() => { void deleteNote(n.id).then(() => setNotes((items) => items.filter((item) => item.id !== n.id))); }} className="shrink-0 text-muted-foreground/60 hover:text-destructive" title="删除">
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
                 </div>
